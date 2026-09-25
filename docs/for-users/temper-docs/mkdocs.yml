@@ -127,6 +127,7 @@ nav:
     - reference/modules.md
     - Target Language List: reference/target-languages.md
     - reference/backend.md
+    - reference/backend-lowering.md
     - reference/out-grammar.md
   - Blog:
     - blog/index.md
