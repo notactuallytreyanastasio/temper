@@ -565,7 +565,7 @@ flag means exactly one thing:
 - `isSupported`: the backend is listed in `temper help`.
 - `isDefaultSupported`: it is built when `temper build` has no `-b` flag.
 - `isTested`: it gets a column in the functional test matrix. It does not run
-  anything.
+  anything; see [Verifying a Backend](backend-verification.md).
 
 ### Specifics
 
@@ -721,6 +721,13 @@ new tests have been inserted into this list based on estimated fit.
 
 Anyone following this list might recommend updates based on their experience.
 Best order might also depend on backend language.
+
+## Further reading
+
+- [Lowering onto a Smaller Language](backend-lowering.md): what to do when the
+  target lacks loops, statements, modules or libraries Temper assumes.
+- [Verifying a Backend](backend-verification.md): what a green functional test
+  matrix does and does not tell you.
 
 ## Glossary
 
