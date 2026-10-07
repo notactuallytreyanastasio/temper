@@ -498,18 +498,172 @@ yet.
 
 ## Lifecycle of a Backend
 
-TODO: Talk about PreAnalysis and metadata, getting your ducks in a row before
-translation, and cross-library dependencies. There are comments for each of the
-lifecycle methods. Maybe turn those into snippets and have a grouping snippet
-that embeds them each.
+A backend instance translates one library. When several libraries are built
+together, each gets its own instance of your backend, and those instances are
+*siblings*. `applyBackendsSynchronously`, in
+`be-helpers/src/commonMain/kotlin/lang/temper/be/syncstaging/ApplyBackendsSynchronously.kt`,
+drives them through the steps below.
+
+Every step is its own loop over all the siblings. So a step finishes for every
+library before the next step starts for any of them. Every `finishTmpL` runs
+before any `translate`, and every `translate` runs before any `collate`. Those
+barriers are the only places siblings can see each other's work.
+
+| Step | Method on `Backend` | Override? | What it is for |
+| ---- | ---- | ---- | ---- |
+| 1 | `setup(cancelGroup)` | no | Initializes backend state. |
+| 2 | `preAnalysis(siblings)` | optionally, calling `super` | "Look at names and type declarations before trying to translate either or expressions." The default stores qualified-name mappings and the signature adjustments your *SupportNetwork* asks for. |
+| 3 | `tentativeTmpL()` | **yes**, abstract | Produces a `TmpL.ModuleSet` for this library, almost always by running *TmpLTranslator* under your *SupportNetwork*. |
+| 4 | `finishTmpL(tentative, siblings)` | optionally, calling `super` | "A joining step that lets each sibling backend consider its tentativeTmpL in the context of its siblings tentative translations." The default rewrites imports with signature information and calls `registerCrossLibraryImports`, which records cross-library dependencies. |
+| 5 | `loadKeepFiles` / `acceptKeepFiles` | rarely | Reads names chosen by earlier builds. |
+| 6 | `translate(finished)` | **yes**, abstract | Turns the finished `TmpL.ModuleSet` into output trees: a list of `OutputFileSpecification`. "Sibling backends may perform this step in parallel." |
+| 7 | `saveKeepFiles` / `selectNames` | rarely | Saves name selections so later builds keep them stable. |
+| 8 | `collate(outputFiles, siblings)` | optionally, calling `super` | "Allows sibling backends to compare notes and allows this backend to make any final adjustments to its own output file specifications." |
+| 9 | `preWrite(outputFiles)` | optionally | Applies what `collate` learned to the files from `translate`. |
+| 10 | `writeOutputFiles`, `writeKeepFiles` | no | Writes files. Two files at one path with different content is an error. |
+| 11 | `postWrite(outputFiles, keepFiles)` | optionally | Runs target-language tools over the written files, such as a formatter or a package step. |
+
+For a first backend, you implement `tentativeTmpL` and `translate` and leave
+the rest alone.
+
+Three consequences of the barriers catch new backends:
+
+- **Dependency order is not translation order.** Siblings are grouped into
+  buckets whose "later groups depend on earlier groups", but within one call
+  every sibling's `translate` may run in any order, even in parallel. If your
+  target language has no module system and you have to inline a dependency's
+  code into its dependent, take the dependency's `TmpL` at the `finishTmpL`
+  barrier, which is complete for every sibling, rather than waiting for the
+  dependency's `translate` output.
+- **Per-library state is not per-module state.** `translate` receives every
+  module of the library at once. Anything that must be unique across the
+  output, such as a counter for generated names, belongs to the `translate`
+  call rather than to a per-module translator object. The Blimp backend kept one
+  counter per module, spliced all modules into one file, and got two
+  definitions named `blimp_loop_3`. The later one silently won, and a generic
+  function returned the wrong element with no error at all
+  ([f01fe0d](https://github.com/notactuallytreyanastasio/temper-blimp/commit/f01fe0d)).
+- **`finishTmpL` does real work.** If you override it, call `super`, or
+  cross-library imports and dependencies will be missing.
+
+### The factory and its support level
+
+Your backend's companion object implements `Backend.Factory`. The members you
+will touch first:
+
+- `backendId`: the ID chosen above.
+- `specifics: RunnerSpecifics`: how to build and run translated code (see
+  *Specifics* below).
+- `coreLibraryResources`: files copied into the output alongside translated
+  code.
+- `make(setup)`: creates a backend instance for one library.
+
+Whether the backend is listed, built by default, or tested is not a factory
+member. It is the `@BackendSupportLevel` annotation on the factory, and each
+flag means exactly one thing:
+
+- `isSupported`: the backend is listed in `temper help`.
+- `isDefaultSupported`: it is built when `temper build` has no `-b` flag.
+- `isTested`: it gets a column in the functional test matrix. It does not run
+  anything.
+
+### Specifics
+
+A *Specifics* object tells the test harness which tools your target needs and
+how to run translated code. `RunnerSpecifics`, in
+`be/src/commonMain/kotlin/lang/temper/be/cli/Specifics.kt`, requires
+`runSingleSource`. In practice you also override the `runBestEffort` overload
+that takes a single `Dependencies`, because the default one errors with
+"Dependencies expected for multiple backends". `LuaFunctionalTest` is a short
+example of a functional test using its specifics to run translated code.
 
 ## Support Networks connect Temper builtins to support code
 
-TODO: Flesh out SupportNetwork comments and embed them strategically to produce
-docs on SupportNetwork and what each piece does.
+Your backend's `SupportNetwork`, in
+`be/src/commonMain/kotlin/lang/temper/be/tmpl/SupportNetwork.kt`, shapes the
+`TmpL` your translator receives. It does two jobs. It picks a strategy for each
+language feature that has more than one reasonable translation, and it decides,
+for every builtin and `@connected` declaration, what code stands in for it.
 
-Note that using code from or referencing an existing backend might simplify the
-effort here and in other aspects of writing a backend.
+### Strategies
+
+Pick each strategy from what the target language actually has, not from what
+looks easiest to implement. Each choice changes the shape of the `TmpL` you
+receive.
+
+| Member | Choices | Pick based on |
+| ---- | ---- | ---- |
+| `bubbleStrategy` | `Exceptions`: an `orelse` arrives as a `TmpL.TryStatement`. `Results`: bubbling calls return result values you unpack and test. | Whether the target has exceptions you can catch. |
+| `coroutineStrategy` | `TranslateToGenerator`: you receive `TmpL.YieldStatement`s. `TranslateToRegularFunction`: the frontend has already rewritten generators into state machines of ordinary functions. | Whether the target has generator functions. |
+| `functionTypeStrategy` | `ToFunctionType` or `ToFunctionalInterface` | Whether functions are values with structural types, or need a named interface type. |
+| `computedJumpStrategy` | `NeverUse`, `IsDefaultBreakScope` (a C-style `switch`), `Use` (a `match` that needs no `break`) | What the target's multi-way branch looks like. |
+| `representationOfVoid(genre)` | `ReifyVoid`, `DoNotReifyVoid` | Whether "no value" is itself a value in the target. |
+
+What the existing backends chose:
+
+| Backend | Bubble | Coroutine | Computed jump | Void |
+| ---- | ---- | ---- | ---- | ---- |
+| JS | Exceptions | TranslateToGenerator | IsDefaultBreakScope | ReifyVoid |
+| Python | Exceptions | TranslateToGenerator | NeverUse | DoNotReifyVoid |
+| C# | Exceptions | TranslateToGenerator | IsDefaultBreakScope | DoNotReifyVoid |
+| Java | Exceptions | TranslateToRegularFunction | IsDefaultBreakScope | DoNotReifyVoid |
+| Rust | Results | TranslateToRegularFunction | Use | ReifyVoid |
+
+A strategy is cheap to change early and expensive later, because every
+lowering you write assumes the shape it produces. Keep each one a single
+line you could swap. The Blimp backend started with `TranslateToGenerator` and
+switched to `TranslateToRegularFunction` within the first day, once it was
+clear the target had no generators to translate to.
+
+### How a call reaches your code
+
+For a call to a builtin or to a `@connected` declaration, *TmpLTranslator* asks
+the network in this order:
+
+1. If the callee has a connected key, such as `core.type String.get isEmpty()`,
+   it calls `translateConnectedReference(pos, connectedKey, genre)`.
+2. If that returns `null` and the callee is a builtin, it calls
+   `getSupportCode(pos, builtin, genre)`. Operators arrive this way, as a
+   `NamedBuiltinFun` whose `builtinOperatorId` (`PlusInt`, `DivIntInt`,
+   `BooleanNegation` and about eighty others) you switch on.
+3. An `InlineSupportCode` result is inlined at the call site: your translator
+   gets `inlineToTree` with the translated arguments. Any other `SupportCode` is
+   declared once per module as a `TmpL.SupportCodeDeclaration` and called by
+   name.
+4. If nothing claims the call, the result depends on what the callee is. A
+   `@connected` declaration with a Temper body falls back to that body, which is
+   what `null` from `translateConnectedReference` means: "the original Temper
+   method implementation should be used". A builtin that no support code
+   claims becomes a garbage node, `builtin X not supported by <backendDescription>`,
+   logged as an error.
+
+So an unhandled operator is a build-time error, not wrong output. The list of
+connected keys a backend may claim is kept up to date in
+`be/src/commonMain/kotlin/lang/temper/be/README.md`.
+
+Connected *types*, such as `Date` or `DenseBitVector`, go through
+`translatedConnectedType`. Return `null` to use Temper's own definition.
+
+### Kinds of support code
+
+`SupportCode` is sealed. The kinds you will use:
+
+- `InlineSupportCode`: expands at the call site. Use it for anything that maps
+  onto one target expression: an operator, a builtin call, a field read.
+- `InlineTmpLSupportCode`: expands during `TmpL` generation, before your
+  translator sees the tree.
+- `FunctionSupportCode` and `NamedSupportCode`: a helper emitted once and
+  called by name. Use these when the target needs a few lines to get Temper's
+  semantics, and give them a `baseName` hint.
+- `SeparatelyCompiledSupportCode`: a reference to code shipped separately,
+  such as a runtime library in your target language.
+
+Support code may require other support code through `requires`, and the network
+must keep those requirements free of cycles.
+
+Returning `null` everywhere is a legitimate place to start: every builtin
+without support code then fails loudly at build time, and each failure tells
+you the next entry to write.
 
 ## Iterating on functional tests
 
@@ -576,15 +730,26 @@ responsible for converting Temper syntax trees into JS.
 
 *backend test*: tests relating Temper inputs to target language translations.
 
-connections
+*connected*: a Temper declaration marked `@connected`, whose implementation a
+backend may replace with target-language code. See *Support Networks*.
 
-grammar / formatting test
+*functional test*: a Temper program from the shared suite, compiled by a
+backend and run with the target's toolchain; its output is compared with the
+expected output.
 
-functional test
+*grammar / formatting test*: a test that builds an output tree by hand and
+checks the source text it renders to.
 
-output grammar
+*output grammar*: an `*.out-grammar` file declaring a target language's output
+trees and how they print.
 
-support code
+*sibling*: another instance of the same backend, translating another library
+in the same build. See *Lifecycle of a Backend*.
+
+*support code*: target-language code that stands in for a Temper builtin or
+`@connected` declaration, chosen by the backend's *SupportNetwork*.
+
+*TmpL*: layered Temper, the tree form the frontend hands to backends.
 
 *target language*: a programming language that's a target of translation, such
 as performed by a Temper backend.
